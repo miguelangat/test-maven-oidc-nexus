@@ -146,9 +146,34 @@ jobs:
         run: |
           echo "🚀 Deploying artifacts to Nexus..."
 
-          # Deploy using the configured settings.xml with Bearer token
-          mvn deploy -DskipTests -B \
-            -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn
+          # Deploy using curl directly for better Bearer token control
+          GROUP_ID=$(mvn help:evaluate -Dexpression=project.groupId -q -DforceStdout)
+          ARTIFACT_ID=$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout)
+          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+
+          # Build the JAR path
+          JAR_FILE="target/${ARTIFACT_ID}-${VERSION}.jar"
+          POM_FILE="pom.xml"
+
+          # Construct paths for Nexus
+          GROUP_PATH=${GROUP_ID//./\/}
+          ARTIFACT_PATH="$GROUP_PATH/$ARTIFACT_ID/$VERSION"
+
+          # Upload JAR
+          echo "Uploading JAR: $JAR_FILE"
+          curl -v -X PUT \
+            -H "Authorization: Bearer $NEXUS_TOKEN" \
+            -H "Content-Type: application/java-archive" \
+            --data-binary "@$JAR_FILE" \
+            "$NEXUS_URL/repository/maven-snapshots/$ARTIFACT_PATH/${ARTIFACT_ID}-${VERSION}.jar"
+
+          # Upload POM
+          echo "Uploading POM: $POM_FILE"
+          curl -v -X PUT \
+            -H "Authorization: Bearer $NEXUS_TOKEN" \
+            -H "Content-Type: application/xml" \
+            --data-binary "@$POM_FILE" \
+            "$NEXUS_URL/repository/maven-snapshots/$ARTIFACT_PATH/${ARTIFACT_ID}-${VERSION}.pom"
 
           echo "✅ Deployment completed successfully"
 
