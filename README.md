@@ -66,3 +66,4 @@ The workflow automatically:
 # FINAL TEST - Nexus ready with debug logging
 # Test commit 1770668417
 # Test with PostgreSQL and HA mode 1770668960
+# Test with admin privileges 1770670528
