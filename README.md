@@ -63,3 +63,4 @@ The workflow automatically:
 # Testing with debug logging
 # Testing with correct debug build
 # Final test with clean build
+# FINAL TEST - Nexus ready with debug logging
