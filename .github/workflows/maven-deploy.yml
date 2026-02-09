@@ -135,7 +135,7 @@ jobs:
               <mirror>
                 <id>nexus-central</id>
                 <name>Nexus Maven Central Mirror</name>
-                <url>${env.NEXUS_URL}/repository/maven-central/</url>
+                <url>${env.NEXUS_URL}/repository/mym2binaries/</url>
                 <mirrorOf>central</mirrorOf>
               </mirror>
             </mirrors>
