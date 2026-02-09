@@ -61,3 +61,4 @@ The workflow automatically:
 # Testing after Nexus restart
 # Testing with sub claim
 # Testing with debug logging
+# Testing with correct debug build
