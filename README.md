@@ -57,3 +57,4 @@ The workflow automatically:
 - Nexus Repository Manager Pro Edition with OIDC Token Plugin
 - GitHub repository with Actions enabled
 
+# Testing with correct claims
