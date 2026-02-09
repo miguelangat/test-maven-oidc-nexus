@@ -1,0 +1,238 @@
+name: Maven Build and Deploy with Nexus OIDC
+
+on:
+  push:
+    branches: [ main, master, develop ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+# Required for OIDC token generation
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  NEXUS_URL: https://donette-nonnotational-unobscenely.ngrok-free.dev
+  JAVA_VERSION: '21'
+  MAVEN_VERSION: '3.9.9'
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    name: Build and Deploy Maven Artifacts
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Get GitHub OIDC Token
+        id: get-github-token
+        run: |
+          echo "🔑 Requesting GitHub OIDC token..."
+
+          GITHUB_TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$NEXUS_URL" | jq -r '.value')
+
+          if [ -z "$GITHUB_TOKEN" ] || [ "$GITHUB_TOKEN" = "null" ]; then
+            echo "❌ Failed to get GitHub OIDC token"
+            exit 1
+          fi
+
+          echo "✅ Successfully obtained GitHub OIDC token"
+
+          # Decode token to show GitHub identity (for debugging)
+          echo ""
+          echo "📋 GitHub Token Claims (Identity Info):"
+          echo "$GITHUB_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq '{
+            repository: .repository,
+            workflow: .workflow,
+            ref: .ref,
+            actor: .actor,
+            repository_owner: .repository_owner
+          }' || echo "Unable to decode"
+
+          echo "::add-mask::$GITHUB_TOKEN"
+          echo "GITHUB_OIDC_TOKEN=$GITHUB_TOKEN" >> $GITHUB_ENV
+
+      - name: Exchange for Nexus Token
+        id: get-nexus-token
+        run: |
+          echo "🔄 Exchanging GitHub token for Nexus access token..."
+
+          RESPONSE=$(curl -sS -X POST $NEXUS_URL/service/rest/oauth2/token \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            -d 'grant_type=urn:ietf:params:oauth:grant-type:token-exchange' \
+            -d "subject_token=$GITHUB_OIDC_TOKEN" \
+            -d 'subject_token_type=urn:ietf:params:oauth:token-type:access_token' \
+            -d 'scope=maven:deploy repository:write')
+
+          NEXUS_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
+
+          if [ -z "$NEXUS_TOKEN" ] || [ "$NEXUS_TOKEN" = "null" ]; then
+            echo "❌ Failed to exchange tokens"
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "✅ Successfully obtained Nexus access token"
+          echo "Token expires in: $(echo "$RESPONSE" | jq -r '.expires_in') seconds"
+          echo "Granted scopes: $(echo "$RESPONSE" | jq -r '.scope')"
+
+          echo "::add-mask::$NEXUS_TOKEN"
+          echo "NEXUS_TOKEN=$NEXUS_TOKEN" >> $GITHUB_ENV
+
+      - name: Configure Maven Settings
+        run: |
+          echo "⚙️ Configuring Maven settings.xml with Nexus token..."
+
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <settings xmlns="http://maven.apache.org/SETTINGS/1.2.0"
+                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                    xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.2.0
+                    http://maven.apache.org/xsd/settings-1.2.0.xsd">
+
+            <servers>
+              <!-- Nexus authentication using Bearer token -->
+              <server>
+                <id>nexus-releases</id>
+                <configuration>
+                  <httpHeaders>
+                    <property>
+                      <name>Authorization</name>
+                      <value>Bearer ${env.NEXUS_TOKEN}</value>
+                    </property>
+                  </httpHeaders>
+                </configuration>
+              </server>
+
+              <server>
+                <id>nexus-snapshots</id>
+                <configuration>
+                  <httpHeaders>
+                    <property>
+                      <name>Authorization</name>
+                      <value>Bearer ${env.NEXUS_TOKEN}</value>
+                    </property>
+                  </httpHeaders>
+                </configuration>
+              </server>
+            </servers>
+
+            <mirrors>
+              <!-- Optional: Use Nexus as Maven Central mirror -->
+              <mirror>
+                <id>nexus-central</id>
+                <name>Nexus Maven Central Mirror</name>
+                <url>${env.NEXUS_URL}/repository/maven-central/</url>
+                <mirrorOf>central</mirrorOf>
+              </mirror>
+            </mirrors>
+
+          </settings>
+          EOF
+
+          echo "✅ Maven settings.xml configured"
+
+      - name: Build with Maven
+        run: |
+          echo "🔨 Building Maven project..."
+          mvn clean verify -B -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn
+          echo "✅ Build completed successfully"
+
+      - name: Deploy to Nexus
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "🚀 Deploying artifacts to Nexus..."
+
+          # Deploy using the configured settings.xml with Bearer token
+          mvn deploy -DskipTests -B \
+            -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn
+
+          echo "✅ Deployment completed successfully"
+
+      - name: Verify Deployment
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "🔍 Verifying deployment..."
+
+          # Extract artifact info from pom.xml
+          GROUP_ID=$(mvn help:evaluate -Dexpression=project.groupId -q -DforceStdout)
+          ARTIFACT_ID=$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout)
+          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+
+          echo "Deployed artifact: $GROUP_ID:$ARTIFACT_ID:$VERSION"
+
+          # Determine repository (snapshots vs releases)
+          if [[ "$VERSION" == *-SNAPSHOT ]]; then
+            REPO="maven-snapshots"
+          else
+            REPO="maven-releases"
+          fi
+
+          # Construct artifact path
+          GROUP_PATH=${GROUP_ID//./\/}
+          ARTIFACT_PATH="$GROUP_PATH/$ARTIFACT_ID/$VERSION"
+          ARTIFACT_URL="$NEXUS_URL/repository/$REPO/$ARTIFACT_PATH/"
+
+          echo "Checking artifact at: $ARTIFACT_URL"
+
+          # Verify artifact exists in Nexus
+          HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $NEXUS_TOKEN" \
+            "$ARTIFACT_URL")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Artifact verified in Nexus repository: $REPO"
+            echo "📦 Artifact URL: $ARTIFACT_URL"
+          else
+            echo "⚠️ Could not verify artifact (HTTP $HTTP_CODE)"
+            echo "Note: Artifact may still be deployed successfully"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "📊 Deployment Summary"
+          echo "=========================================="
+          echo "Repository: ${{ github.repository }}"
+          echo "Ref: ${{ github.ref }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Actor: ${{ github.actor }}"
+          echo ""
+
+          if [ -n "$NEXUS_TOKEN" ]; then
+            echo "✅ OIDC token exchange: SUCCESS"
+            echo "✅ Maven build: SUCCESS"
+
+            if [ "${{ github.event_name }}" != "pull_request" ]; then
+              echo "✅ Nexus deployment: SUCCESS"
+              echo ""
+              echo "🎉 Artifacts deployed to Nexus without credentials!"
+            else
+              echo "ℹ️  Deployment skipped (pull request)"
+            fi
+          else
+            echo "❌ OIDC token exchange: FAILED"
+          fi
+          echo "=========================================="
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Remove settings.xml to ensure token is not persisted
+          rm -f ~/.m2/settings.xml
+          echo "🧹 Cleaned up temporary Maven settings"
