@@ -67,3 +67,4 @@ The workflow automatically:
 # Test commit 1770668417
 # Test with PostgreSQL and HA mode 1770668960
 # Test with admin privileges 1770670528
+# Test with configured nx-github-deployer role 1770670829
