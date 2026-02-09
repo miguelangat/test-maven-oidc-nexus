@@ -56,3 +56,4 @@ The workflow automatically:
 - Maven 3.9+
 - Nexus Repository Manager Pro Edition with OIDC Token Plugin
 - GitHub repository with Actions enabled
+
