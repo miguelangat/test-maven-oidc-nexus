@@ -62,3 +62,4 @@ The workflow automatically:
 # Testing with sub claim
 # Testing with debug logging
 # Testing with correct debug build
+# Final test with clean build
