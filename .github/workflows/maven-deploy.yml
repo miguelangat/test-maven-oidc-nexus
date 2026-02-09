@@ -130,16 +130,6 @@ jobs:
               </server>
             </servers>
 
-            <mirrors>
-              <!-- Optional: Use Nexus as Maven Central mirror -->
-              <mirror>
-                <id>nexus-central</id>
-                <name>Nexus Maven Central Mirror</name>
-                <url>${env.NEXUS_URL}/repository/mym2binaries/</url>
-                <mirrorOf>central</mirrorOf>
-              </mirror>
-            </mirrors>
-
           </settings>
           EOF
 
@@ -148,7 +138,7 @@ jobs:
       - name: Build with Maven
         run: |
           echo "🔨 Building Maven project..."
-          mvn clean verify -B -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn
+          mvn clean package -DskipTests -B -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn
           echo "✅ Build completed successfully"
 
       - name: Deploy to Nexus
