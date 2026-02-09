@@ -60,3 +60,4 @@ The workflow automatically:
 # Testing with correct claims
 # Testing after Nexus restart
 # Testing with sub claim
+# Testing with debug logging
