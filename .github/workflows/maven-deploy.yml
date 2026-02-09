@@ -96,7 +96,7 @@ jobs:
           echo "⚙️ Configuring Maven settings.xml with Nexus token..."
 
           mkdir -p ~/.m2
-          cat > ~/.m2/settings.xml <<'EOF'
+          cat > ~/.m2/settings.xml <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <settings xmlns="http://maven.apache.org/SETTINGS/1.2.0"
                     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -111,7 +111,7 @@ jobs:
                   <httpHeaders>
                     <property>
                       <name>Authorization</name>
-                      <value>Bearer ${env.NEXUS_TOKEN}</value>
+                      <value>Bearer $NEXUS_TOKEN</value>
                     </property>
                   </httpHeaders>
                 </configuration>
@@ -123,7 +123,7 @@ jobs:
                   <httpHeaders>
                     <property>
                       <name>Authorization</name>
-                      <value>Bearer ${env.NEXUS_TOKEN}</value>
+                      <value>Bearer $NEXUS_TOKEN</value>
                     </property>
                   </httpHeaders>
                 </configuration>
