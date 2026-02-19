@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 env:
-  NEXUS_URL: https://mgarzon.dev.repo.saas.sonatype.dev/
+  NEXUS_URL: https://mgarzon.dev.repo.saas.sonatype.dev
   JAVA_VERSION: '21'
   MAVEN_VERSION: '3.9.9'
 
