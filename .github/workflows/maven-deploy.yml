@@ -113,6 +113,73 @@ jobs:
           echo "::add-mask::$NEXUS_TOKEN"
           echo "NEXUS_TOKEN=$NEXUS_TOKEN" >> $GITHUB_ENV
 
+      - name: Diagnose Nexus token
+        run: |
+          set -euo pipefail
+          echo "🔍 Decoding Nexus JWT payload (non-sensitive — signature omitted)..."
+
+          # Decode the JWT payload (middle segment) so we can read iss/sub/aud/exp/scope.
+          # base64 of a JWT segment is URL-safe and may lack padding — fix that before decoding.
+          decode_jwt_payload() {
+            local seg="$1"
+            # Restore base64 padding
+            local pad=$(( (4 - ${#seg} % 4) % 4 ))
+            seg="${seg}$(printf '=%.0s' $(seq 1 $pad))"
+            # tr to standard alphabet
+            printf '%s' "$seg" | tr -- '-_' '+/' | base64 -d 2>/dev/null
+          }
+
+          PAYLOAD=$(echo "$NEXUS_TOKEN" | cut -d. -f2)
+          DECODED=$(decode_jwt_payload "$PAYLOAD")
+
+          echo ""
+          echo "📋 Decoded Nexus token payload:"
+          echo "$DECODED" | jq '{
+            iss: .iss,
+            sub: .sub,
+            aud: .aud,
+            scope: .scope,
+            scopes: .scopes,
+            realm: .realm,
+            iat: .iat,
+            exp: .exp,
+            exp_human: (.exp | todateiso8601),
+            now_human: (now | todateiso8601),
+            seconds_until_expiry: (.exp - now | floor)
+          }' || echo "Unable to decode/parse"
+
+          echo ""
+          echo "🔍 Probing the token against a known authenticated endpoint..."
+
+          # If the token is valid, /v1/status will return 200 with a JSON body.
+          # If Nexus rejects the Bearer, we'll get 401 + a basic challenge here too,
+          # which is the same failure mode as the deploy step — proves the issue isn't
+          # Maven plumbing, it's the token itself.
+          PROBE_BODY=$(mktemp)
+          PROBE_STATUS=$(curl -sS -o "$PROBE_BODY" -w '%{http_code}' \
+            -H "Authorization: Bearer $NEXUS_TOKEN" \
+            "$NEXUS_URL/service/rest/v1/status")
+          echo "Probe HTTP status: $PROBE_STATUS"
+          echo "Response headers worth knowing:"
+          curl -sSI -H "Authorization: Bearer $NEXUS_TOKEN" \
+            "$NEXUS_URL/service/rest/v1/status" 2>&1 | grep -iE '^(HTTP|www-authenticate|x-content-type)' | head -5
+          echo ""
+          if [ "$PROBE_STATUS" -eq 200 ]; then
+            echo "✅ Token is accepted by Nexus on /v1/status — the deploy 401 is a privilege issue, not an auth one."
+            echo "Body: $(cat "$PROBE_BODY")"
+          else
+            echo "❌ Token rejected by Nexus on /v1/status with HTTP $PROBE_STATUS"
+            echo "Body: $(cat "$PROBE_BODY")"
+            echo ""
+            echo "This means the Bearer token itself isn't being accepted as authenticated."
+            echo "Common causes (look at the Nexus app log on the SaaS instance):"
+            echo "  * Token expired or wall-clock drift on Nexus"
+            echo "  * No provisioned user for the JWT 'sub' claim"
+            echo "  * 'aud' claim doesn't match Nexus's expected audience"
+            echo "  * Signature failed JWKS validation"
+          fi
+          rm -f "$PROBE_BODY"
+
       - name: Configure Maven Settings
         run: |
           set -euo pipefail
