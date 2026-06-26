@@ -115,7 +115,10 @@ jobs:
 
       - name: Diagnose Nexus token
         run: |
-          set -euo pipefail
+          # NOT using `set -e`/pipefail here: the probes are intentionally allowed to fail
+          # so we can read every status code. `grep | head -1` triggers SIGPIPE → non-zero
+          # exit → would kill the step under pipefail. Diagnostics shouldn't be load-bearing.
+          set +e
           echo "🔍 Decoding Nexus JWT payload (non-sensitive — signature omitted)..."
 
           # Decode the JWT payload (middle segment) so we can read iss/sub/aud/exp/scope.
