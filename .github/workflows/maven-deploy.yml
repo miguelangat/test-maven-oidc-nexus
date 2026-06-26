@@ -149,34 +149,59 @@ jobs:
           }' || echo "Unable to decode/parse"
 
           echo ""
-          echo "🔍 Probing the token against a known authenticated endpoint..."
-
-          # If the token is valid, /v1/status will return 200 with a JSON body.
-          # If Nexus rejects the Bearer, we'll get 401 + a basic challenge here too,
-          # which is the same failure mode as the deploy step — proves the issue isn't
-          # Maven plumbing, it's the token itself.
-          PROBE_BODY=$(mktemp)
-          PROBE_STATUS=$(curl -sS -o "$PROBE_BODY" -w '%{http_code}' \
-            -H "Authorization: Bearer $NEXUS_TOKEN" \
-            "$NEXUS_URL/service/rest/v1/status")
-          echo "Probe HTTP status: $PROBE_STATUS"
-          echo "Response headers worth knowing:"
-          curl -sSI -H "Authorization: Bearer $NEXUS_TOKEN" \
-            "$NEXUS_URL/service/rest/v1/status" 2>&1 | grep -iE '^(HTTP|www-authenticate|x-content-type)' | head -5
+          echo "🔍 Probing the token against authenticated and write endpoints..."
           echo ""
-          if [ "$PROBE_STATUS" -eq 200 ]; then
-            echo "✅ Token is accepted by Nexus on /v1/status — the deploy 401 is a privilege issue, not an auth one."
-            echo "Body: $(cat "$PROBE_BODY")"
-          else
-            echo "❌ Token rejected by Nexus on /v1/status with HTTP $PROBE_STATUS"
-            echo "Body: $(cat "$PROBE_BODY")"
-            echo ""
-            echo "This means the Bearer token itself isn't being accepted as authenticated."
-            echo "Common causes (look at the Nexus app log on the SaaS instance):"
-            echo "  * Token expired or wall-clock drift on Nexus"
-            echo "  * No provisioned user for the JWT 'sub' claim"
-            echo "  * 'aud' claim doesn't match Nexus's expected audience"
-            echo "  * Signature failed JWKS validation"
+
+          # /v1/status is UNAUTHENTICATED on NXRM (returns 200 to anonymous).
+          # Use /v1/security/users which requires nexus:users:read — distinguishes:
+          #   200 → token authenticated AND user has nexus:users:read (likely admin)
+          #   403 → token authenticated, user lacks privilege (still useful — auth works)
+          #   401 → token NOT authenticated by OIDC realm; this is the real failure mode
+          #
+          # Also probe the snapshot repo's directory listing with auth.
+          # A separate maven-snapshots write probe (HEAD) confirms the deploy-time privilege.
+          probe() {
+            local label="$1" url="$2"
+            local body http_code
+            body=$(mktemp)
+            http_code=$(curl -sS -o "$body" -w '%{http_code}' \
+              -H "Authorization: Bearer $NEXUS_TOKEN" "$url") || http_code="curl-error"
+            printf '%-40s HTTP %s\n' "$label" "$http_code"
+            # If non-2xx, surface body + auth-challenge header for clarity
+            if [ "$http_code" != "200" ] && [ "$http_code" != "204" ]; then
+              local challenge snippet
+              challenge=$(curl -sSI -H "Authorization: Bearer $NEXUS_TOKEN" "$url" 2>/dev/null \
+                | grep -i '^www-authenticate' | head -1 | tr -d '\r')
+              [ -n "$challenge" ] && echo "  $challenge"
+              snippet=$(head -c 300 "$body" 2>/dev/null)
+              [ -n "$snippet" ] && echo "  body[:300]: $snippet"
+            fi
+            rm -f "$body"
+          }
+
+          probe "GET /v1/security/users (auth probe)"             "$NEXUS_URL/service/rest/v1/security/users?source=default"
+          probe "GET /repository/maven-snapshots/"                "$NEXUS_URL/repository/maven-snapshots/"
+          probe "GET maven-snapshots metadata for our artifact"   "$NEXUS_URL/repository/maven-snapshots/com/sonatype/test/nexus-oidc-test/maven-metadata.xml"
+
+          # PUT a tiny test file to a writeable path to see if the user can write.
+          # Use a unique random path under maven-snapshots so we don't clobber anything.
+          PROBE_PATH="com/sonatype/test/auth-probe/$(date +%Y%m%d%H%M%S)/probe.txt"
+          PROBE_URL="$NEXUS_URL/repository/maven-snapshots/$PROBE_PATH"
+          PROBE_BODY=$(mktemp)
+          STATUS=$(curl -sS -o "$PROBE_BODY" -w '%{http_code}' \
+            -X PUT \
+            -H "Authorization: Bearer $NEXUS_TOKEN" \
+            -H "Content-Type: text/plain" \
+            --data-binary "auth-probe" \
+            "$PROBE_URL") || STATUS="curl-error"
+          printf '%-40s HTTP %s  (path: %s)\n' "PUT maven-snapshots probe file" "$STATUS" "$PROBE_PATH"
+          if [ "$STATUS" != "200" ] && [ "$STATUS" != "201" ] && [ "$STATUS" != "204" ]; then
+            SNIPPET=$(head -c 300 "$PROBE_BODY" 2>/dev/null)
+            [ -n "$SNIPPET" ] && echo "  body[:300]: $SNIPPET"
+            CHALLENGE=$(curl -sSI -X PUT --data-binary "" \
+              -H "Authorization: Bearer $NEXUS_TOKEN" "$PROBE_URL" 2>/dev/null \
+              | grep -i '^www-authenticate' | head -1 | tr -d '\r')
+            [ -n "$CHALLENGE" ] && echo "  $CHALLENGE"
           fi
           rm -f "$PROBE_BODY"
 
