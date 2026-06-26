@@ -38,9 +38,11 @@ jobs:
       - name: Get GitHub OIDC Token
         id: get-github-token
         run: |
+          set -euo pipefail
           echo "🔑 Requesting GitHub OIDC token..."
 
-          GITHUB_TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          GITHUB_TOKEN=$(curl -sS \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$NEXUS_URL" | jq -r '.value')
 
           if [ -z "$GITHUB_TOKEN" ] || [ "$GITHUB_TOKEN" = "null" ]; then
@@ -58,7 +60,8 @@ jobs:
             workflow: .workflow,
             ref: .ref,
             actor: .actor,
-            repository_owner: .repository_owner
+            repository_owner: .repository_owner,
+            sub: .sub
           }' || echo "Unable to decode"
 
           echo "::add-mask::$GITHUB_TOKEN"
@@ -67,36 +70,59 @@ jobs:
       - name: Exchange for Nexus Token
         id: get-nexus-token
         run: |
+          set -euo pipefail
           echo "🔄 Exchanging GitHub token for Nexus access token..."
 
-          RESPONSE=$(curl -sS -X POST $NEXUS_URL/service/rest/oauth2/token \
+          # Capture status + body so we can fail loudly on non-2xx.
+          # Requested scopes must be present in Nexus's PrivilegeToScopeMapper:
+          #   repository:read / repository:write / repository:delete / repository:admin
+          #   <format>:read   / <format>:write   / <format>:delete   / <format>:admin
+          # `maven:write` covers our maven-snapshots PUTs; `repository:write` is the generic
+          # fallback. Avoid invented scopes like `maven:deploy` — they get filtered out and
+          # if none of the requested scopes survive the filter, Nexus returns invalid_scope.
+          HTTP_RESPONSE=$(mktemp)
+          HTTP_STATUS=$(curl -sS -o "$HTTP_RESPONSE" -w '%{http_code}' \
+            -X POST "$NEXUS_URL/service/rest/oauth2/token" \
             -H 'Content-Type: application/x-www-form-urlencoded' \
-            -d 'grant_type=urn:ietf:params:oauth:grant-type:token-exchange' \
-            -d "subject_token=$GITHUB_OIDC_TOKEN" \
-            -d 'subject_token_type=urn:ietf:params:oauth:token-type:access_token' \
-            -d 'scope=maven:deploy repository:write')
+            --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:token-exchange' \
+            --data-urlencode "subject_token=$GITHUB_OIDC_TOKEN" \
+            --data-urlencode 'subject_token_type=urn:ietf:params:oauth:token-type:access_token' \
+            --data-urlencode 'scope=repository:write maven:write')
 
-          NEXUS_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
+          BODY=$(cat "$HTTP_RESPONSE")
+          rm -f "$HTTP_RESPONSE"
+
+          if [ "$HTTP_STATUS" -ne 200 ]; then
+            echo "❌ Token exchange failed: HTTP $HTTP_STATUS"
+            echo "Response body: $BODY"
+            exit 1
+          fi
+
+          NEXUS_TOKEN=$(echo "$BODY" | jq -r '.access_token')
 
           if [ -z "$NEXUS_TOKEN" ] || [ "$NEXUS_TOKEN" = "null" ]; then
-            echo "❌ Failed to exchange tokens"
-            echo "Response: $RESPONSE"
+            echo "❌ Response did not include an access_token"
+            echo "Response body: $BODY"
             exit 1
           fi
 
           echo "✅ Successfully obtained Nexus access token"
-          echo "Token expires in: $(echo "$RESPONSE" | jq -r '.expires_in') seconds"
-          echo "Granted scopes: $(echo "$RESPONSE" | jq -r '.scope')"
+          echo "Token expires in: $(echo "$BODY" | jq -r '.expires_in') seconds"
+          echo "Granted scopes: $(echo "$BODY" | jq -r '.scope')"
 
           echo "::add-mask::$NEXUS_TOKEN"
           echo "NEXUS_TOKEN=$NEXUS_TOKEN" >> $GITHUB_ENV
 
       - name: Configure Maven Settings
         run: |
+          set -euo pipefail
           echo "⚙️ Configuring Maven settings.xml with Nexus token..."
 
+          # Note the placeholder ${env.NEXUS_TOKEN} — Maven 3.9+ resolves env.* at runtime,
+          # so we do NOT shell-expand the token into the file on disk. That keeps the secret
+          # out of the artifact cache and out of any debug dump of settings.xml.
           mkdir -p ~/.m2
-          cat > ~/.m2/settings.xml <<EOF
+          cat > ~/.m2/settings.xml <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <settings xmlns="http://maven.apache.org/SETTINGS/1.2.0"
                     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -104,14 +130,14 @@ jobs:
                     http://maven.apache.org/xsd/settings-1.2.0.xsd">
 
             <servers>
-              <!-- Nexus authentication using Bearer token -->
+              <!-- Nexus authentication using Bearer token (resolved from NEXUS_TOKEN env at runtime) -->
               <server>
                 <id>nexus-releases</id>
                 <configuration>
                   <httpHeaders>
                     <property>
                       <name>Authorization</name>
-                      <value>Bearer $NEXUS_TOKEN</value>
+                      <value>Bearer ${env.NEXUS_TOKEN}</value>
                     </property>
                   </httpHeaders>
                 </configuration>
@@ -123,7 +149,7 @@ jobs:
                   <httpHeaders>
                     <property>
                       <name>Authorization</name>
-                      <value>Bearer $NEXUS_TOKEN</value>
+                      <value>Bearer ${env.NEXUS_TOKEN}</value>
                     </property>
                   </httpHeaders>
                 </configuration>
@@ -137,52 +163,41 @@ jobs:
 
       - name: Build with Maven
         run: |
+          set -euo pipefail
           echo "🔨 Building Maven project..."
-          mvn clean package -DskipTests -B -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn
+          mvn clean package -DskipTests -B \
+            -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn
           echo "✅ Build completed successfully"
 
       - name: Deploy to Nexus
         if: github.event_name != 'pull_request'
         run: |
-          echo "🚀 Deploying artifacts to Nexus..."
+          set -euo pipefail
+          echo "🚀 Deploying artifacts to Nexus via mvn deploy..."
 
-          # Deploy using curl directly for better Bearer token control
-          GROUP_ID=$(mvn help:evaluate -Dexpression=project.groupId -q -DforceStdout)
-          ARTIFACT_ID=$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout)
-          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
-
-          # Build the JAR path
-          JAR_FILE="target/${ARTIFACT_ID}-${VERSION}.jar"
-          POM_FILE="pom.xml"
-
-          # Construct paths for Nexus
-          GROUP_PATH=${GROUP_ID//./\/}
-          ARTIFACT_PATH="$GROUP_PATH/$ARTIFACT_ID/$VERSION"
-
-          # Upload JAR
-          echo "Uploading JAR: $JAR_FILE"
-          curl -v -X PUT \
-            -H "Authorization: Bearer $NEXUS_TOKEN" \
-            -H "Content-Type: application/java-archive" \
-            --data-binary "@$JAR_FILE" \
-            "$NEXUS_URL/repository/maven-snapshots/$ARTIFACT_PATH/${ARTIFACT_ID}-${VERSION}.jar"
-
-          # Upload POM
-          echo "Uploading POM: $POM_FILE"
-          curl -v -X PUT \
-            -H "Authorization: Bearer $NEXUS_TOKEN" \
-            -H "Content-Type: application/xml" \
-            --data-binary "@$POM_FILE" \
-            "$NEXUS_URL/repository/maven-snapshots/$ARTIFACT_PATH/${ARTIFACT_ID}-${VERSION}.pom"
+          # Use mvn deploy rather than hand-rolled curl PUTs. The Maven deploy plugin handles
+          # the things that previously failed:
+          #   * Snapshot timestamp generation (NXRM3 maven-snapshots rejects non-timestamped uploads with 400)
+          #   * maven-metadata.xml authoring
+          #   * Checksum files (.md5, .sha1, .sha256, .sha512)
+          #   * Content-Type negotiation
+          #
+          # `-DaltDeploymentRepository=nexus-snapshots::default::$NEXUS_URL/repository/maven-snapshots/`
+          # overrides whatever distributionManagement says, so the pom.xml's potentially stale
+          # ngrok URL doesn't matter.
+          mvn deploy -DskipTests -B \
+            -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn \
+            -DaltSnapshotDeploymentRepository="nexus-snapshots::default::$NEXUS_URL/repository/maven-snapshots/" \
+            -DaltReleaseDeploymentRepository="nexus-releases::default::$NEXUS_URL/repository/maven-releases/"
 
           echo "✅ Deployment completed successfully"
 
       - name: Verify Deployment
         if: github.event_name != 'pull_request'
         run: |
+          set -euo pipefail
           echo "🔍 Verifying deployment..."
 
-          # Extract artifact info from pom.xml
           GROUP_ID=$(mvn help:evaluate -Dexpression=project.groupId -q -DforceStdout)
           ARTIFACT_ID=$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout)
           VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
@@ -196,24 +211,31 @@ jobs:
             REPO="maven-releases"
           fi
 
-          # Construct artifact path
           GROUP_PATH=${GROUP_ID//./\/}
-          ARTIFACT_PATH="$GROUP_PATH/$ARTIFACT_ID/$VERSION"
-          ARTIFACT_URL="$NEXUS_URL/repository/$REPO/$ARTIFACT_PATH/"
+          ARTIFACT_DIR_URL="$NEXUS_URL/repository/$REPO/$GROUP_PATH/$ARTIFACT_ID/$VERSION/"
+          METADATA_URL="$NEXUS_URL/repository/$REPO/$GROUP_PATH/$ARTIFACT_ID/maven-metadata.xml"
 
-          echo "Checking artifact at: $ARTIFACT_URL"
+          echo "Checking artifact directory: $ARTIFACT_DIR_URL"
 
-          # Verify artifact exists in Nexus
-          HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer $NEXUS_TOKEN" \
-            "$ARTIFACT_URL")
-
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "✅ Artifact verified in Nexus repository: $REPO"
-            echo "📦 Artifact URL: $ARTIFACT_URL"
+          # --fail-with-body so a 4xx surfaces with the server's message; -i to print headers.
+          if curl --fail-with-body -sS -o /tmp/dir.html -w 'HTTP %{http_code}\n' \
+              -H "Authorization: Bearer $NEXUS_TOKEN" \
+              "$ARTIFACT_DIR_URL"; then
+            echo "✅ Artifact directory accessible in $REPO"
           else
-            echo "⚠️ Could not verify artifact (HTTP $HTTP_CODE)"
-            echo "Note: Artifact may still be deployed successfully"
+            echo "⚠️ Could not list artifact directory; deployment may still be present"
+          fi
+
+          echo ""
+          echo "Checking maven-metadata.xml: $METADATA_URL"
+          if curl --fail-with-body -sS -o /tmp/meta.xml -w 'HTTP %{http_code}\n' \
+              -H "Authorization: Bearer $NEXUS_TOKEN" \
+              "$METADATA_URL"; then
+            echo "✅ maven-metadata.xml present"
+            echo "Latest snapshot info:"
+            grep -E '<(timestamp|buildNumber|version|lastUpdated)>' /tmp/meta.xml | head -10 || true
+          else
+            echo "⚠️ Could not fetch maven-metadata.xml"
           fi
 
       - name: Summary
@@ -227,27 +249,11 @@ jobs:
           echo "Ref: ${{ github.ref }}"
           echo "Commit: ${{ github.sha }}"
           echo "Actor: ${{ github.actor }}"
-          echo ""
-
-          if [ -n "$NEXUS_TOKEN" ]; then
-            echo "✅ OIDC token exchange: SUCCESS"
-            echo "✅ Maven build: SUCCESS"
-
-            if [ "${{ github.event_name }}" != "pull_request" ]; then
-              echo "✅ Nexus deployment: SUCCESS"
-              echo ""
-              echo "🎉 Artifacts deployed to Nexus without credentials!"
-            else
-              echo "ℹ️  Deployment skipped (pull request)"
-            fi
-          else
-            echo "❌ OIDC token exchange: FAILED"
-          fi
           echo "=========================================="
 
       - name: Cleanup
         if: always()
         run: |
-          # Remove settings.xml to ensure token is not persisted
+          # Remove settings.xml so the token (resolved via env at runtime) isn't reused.
           rm -f ~/.m2/settings.xml
           echo "🧹 Cleaned up temporary Maven settings"
