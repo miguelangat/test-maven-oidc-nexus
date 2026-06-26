@@ -273,30 +273,83 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
-          echo "🚀 Deploying artifacts to Nexus via mvn deploy..."
+          echo "🚀 Deploying artifacts to Nexus..."
 
-          # Use mvn deploy rather than hand-rolled curl PUTs. The Maven deploy plugin handles
-          # the things that previously failed:
-          #   * Snapshot timestamp generation (NXRM3 maven-snapshots rejects non-timestamped uploads with 400)
-          #   * maven-metadata.xml authoring
-          #   * Checksum files (.md5, .sha1, .sha256, .sha512)
-          #   * Content-Type negotiation
+          # Why this is split into "mvn deploy → local staging dir" + "curl PUT each file":
           #
-          # The alternate-deployment-repository syntax dropped the `::default::` layout segment
-          # in Maven 3.8.1+ (id::url is the modern form; id::layout::url is legacy and warns).
+          # The previous attempt with `mvn deploy` to an HTTP repo kept getting 401 even though
+          # the Bearer token was confirmed valid (a curl PUT to the SAME maven-snapshots path
+          # returned 201). Maven 3.9's wagon-http and resolver-transport-http both ignored our
+          # attempts to inject the Authorization header (settings.xml <httpHeaders>,
+          # -Daether.connector.http.headers.*). Rather than fight the transport, we use the
+          # deploy plugin to produce the correctly-shaped artifacts (timestamped snapshot
+          # filenames, maven-metadata.xml, .md5/.sha1/.sha256/.sha512 checksums) in a local
+          # staging directory, then PUT each file to Nexus with curl + Bearer auth.
           #
-          # The -Daether.connector.http.headers.<serverId>.Authorization fallback covers the
-          # case where Maven routes through maven-resolver-transport-http instead of
-          # maven-wagon-http (which would ignore the <httpHeaders> in settings.xml). With
-          # both paths configured the Bearer header reaches Nexus regardless of which
-          # transport Maven picks.
+          # The OIDC-token Bearer path is verified working by the Diagnose Nexus token step
+          # above (PUT to maven-snapshots returns 201).
+
+          STAGING="$(mktemp -d)"
+          REPO_URL_BASE="$NEXUS_URL/repository/maven-snapshots"
+
+          # 1. Stage the deployment to a local file:// repo.
+          echo ""
+          echo "📦 Staging artifacts to $STAGING ..."
           mvn deploy -DskipTests -B \
             -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn \
-            -DaltSnapshotDeploymentRepository="nexus-snapshots::$NEXUS_URL/repository/maven-snapshots/" \
-            -DaltReleaseDeploymentRepository="nexus-releases::$NEXUS_URL/repository/maven-releases/" \
-            -Daether.connector.http.headers.nexus-snapshots.Authorization="Bearer $NEXUS_TOKEN" \
-            -Daether.connector.http.headers.nexus-releases.Authorization="Bearer $NEXUS_TOKEN"
+            -DaltDeploymentRepository="staging::file://$STAGING" \
+            -DaltSnapshotDeploymentRepository="staging::file://$STAGING" \
+            -DaltReleaseDeploymentRepository="staging::file://$STAGING"
 
+          echo ""
+          echo "📂 Files Maven produced (this is what Nexus will receive):"
+          (cd "$STAGING" && find . -type f -printf '  %p\n' | sort)
+
+          # 2. PUT every file under the staging dir to the corresponding path in Nexus.
+          #    For snapshot artifacts, Maven has already inserted the timestamp into the filenames
+          #    (e.g. nexus-oidc-test-1.0.0-20260626.180716-1.jar) AND has written a
+          #    maven-metadata.xml that points to those timestamped names. We upload everything
+          #    Maven produced verbatim so Nexus sees a complete, valid snapshot release.
+          echo ""
+          echo "🚀 Uploading staged files to $REPO_URL_BASE ..."
+          FAILED=0
+          while IFS= read -r -d '' file; do
+            REL_PATH="${file#$STAGING/}"
+            URL="$REPO_URL_BASE/$REL_PATH"
+
+            # Pick a content-type that NXRM3 maven format handler will accept.
+            case "$file" in
+              *.jar)  CT='application/java-archive' ;;
+              *.pom)  CT='application/xml' ;;
+              *.xml)  CT='application/xml' ;;
+              *.md5 | *.sha1 | *.sha256 | *.sha512) CT='text/plain' ;;
+              *)      CT='application/octet-stream' ;;
+            esac
+
+            CODE=$(curl -sS -o /tmp/upload-resp -w '%{http_code}' \
+              -X PUT \
+              -H "Authorization: Bearer $NEXUS_TOKEN" \
+              -H "Content-Type: $CT" \
+              --data-binary "@$file" \
+              "$URL")
+            if [ "$CODE" = "200" ] || [ "$CODE" = "201" ] || [ "$CODE" = "204" ]; then
+              printf '  %-6s %s\n' "$CODE" "$REL_PATH"
+            else
+              printf '  %-6s %s   ← FAILED\n' "$CODE" "$REL_PATH"
+              echo "    body: $(head -c 300 /tmp/upload-resp)"
+              FAILED=$((FAILED + 1))
+            fi
+          done < <(find "$STAGING" -type f -print0)
+
+          rm -rf "$STAGING"
+
+          if [ "$FAILED" -gt 0 ]; then
+            echo ""
+            echo "❌ $FAILED file(s) failed to upload"
+            exit 1
+          fi
+
+          echo ""
           echo "✅ Deployment completed successfully"
 
       - name: Verify Deployment
