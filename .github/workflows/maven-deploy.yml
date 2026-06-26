@@ -314,7 +314,12 @@ jobs:
           #    maven-metadata.xml that points to those timestamped names. We upload everything
           #    Maven produced verbatim so Nexus sees a complete, valid snapshot release.
           echo ""
+          UPLOAD_START_UTC=$(date -u +'%Y-%m-%d %H:%M:%S UTC')
           echo "🚀 Uploading staged files to $REPO_URL_BASE ..."
+          echo "    upload window started: $UPLOAD_START_UTC"
+          echo "    user (JWT sub):        miguelangat"
+          echo "    correlate with the Nexus SaaS app log on this window."
+          echo ""
 
           # Upload order matters for NXRM3's maven-snapshots format handler:
           #   1. The artifact files first (.jar, .pom).
@@ -385,14 +390,27 @@ jobs:
 
           rm -rf "$STAGING"
 
+          UPLOAD_END_UTC=$(date -u +'%Y-%m-%d %H:%M:%S UTC')
+
           if [ "$FAILED" -gt 0 ]; then
             echo ""
             echo "❌ $FAILED file(s) failed to upload"
+            echo ""
+            echo "─── Nexus SaaS log correlation hint ─────────────────────"
+            echo "  Window:  $UPLOAD_START_UTC  →  $UPLOAD_END_UTC"
+            echo "  User:    miguelangat (JWT sub claim)"
+            echo "  Source:  GitHub Actions runner IP (see Diagnose step output above)"
+            echo ""
+            echo "  Run these on the SaaS Nexus app log:"
+            echo "    grep -E 'OIDCTokenAuthenticationFilter|OIDCTokenRealm' nexus.log | grep -F '$UPLOAD_START_UTC'"
+            echo "    grep -E 'AuthenticationException|UnknownAccountException' nexus.log"
+            echo "    grep 'Rate limit exceeded for user' nexus.log"
+            echo "─────────────────────────────────────────────────────────"
             exit 1
           fi
 
           echo ""
-          echo "✅ Deployment completed successfully"
+          echo "✅ Deployment completed successfully (window: $UPLOAD_START_UTC → $UPLOAD_END_UTC)"
 
       - name: Verify Deployment
         if: github.event_name != 'pull_request'
