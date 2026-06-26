@@ -315,34 +315,73 @@ jobs:
           #    Maven produced verbatim so Nexus sees a complete, valid snapshot release.
           echo ""
           echo "🚀 Uploading staged files to $REPO_URL_BASE ..."
-          FAILED=0
-          while IFS= read -r -d '' file; do
-            REL_PATH="${file#$STAGING/}"
-            URL="$REPO_URL_BASE/$REL_PATH"
 
-            # Pick a content-type that NXRM3 maven format handler will accept.
+          # Upload order matters for NXRM3's maven-snapshots format handler:
+          #   1. The artifact files first (.jar, .pom).
+          #   2. Their checksums next (.md5, .sha1, .sha256, .sha512) — Nexus pairs each
+          #      checksum to the artifact it was just given.
+          #   3. maven-metadata.xml (and its checksums) LAST, so it points at fully-uploaded
+          #      artifacts and isn't a dangling pointer during the upload window.
+          #
+          # We also sleep ~400ms between PUTs to stay under the SaaS instance's per-IP
+          # rate limit (we saw 429s when issuing 12 requests within 3-4 seconds in an earlier
+          # run) and retry once on 429 after backing off.
+          upload_one() {
+            local file="$1" rel ct url code attempt
+            rel="${file#$STAGING/}"
+            url="$REPO_URL_BASE/$rel"
             case "$file" in
-              *.jar)  CT='application/java-archive' ;;
-              *.pom)  CT='application/xml' ;;
-              *.xml)  CT='application/xml' ;;
-              *.md5 | *.sha1 | *.sha256 | *.sha512) CT='text/plain' ;;
-              *)      CT='application/octet-stream' ;;
+              *.jar)  ct='application/java-archive' ;;
+              *.pom)  ct='application/xml' ;;
+              *.xml)  ct='application/xml' ;;
+              *.md5 | *.sha1 | *.sha256 | *.sha512) ct='text/plain' ;;
+              *)      ct='application/octet-stream' ;;
             esac
+            for attempt in 1 2 3; do
+              code=$(curl -sS -o /tmp/upload-resp -w '%{http_code}' \
+                -X PUT \
+                -H "Authorization: Bearer $NEXUS_TOKEN" \
+                -H "Content-Type: $ct" \
+                --data-binary "@$file" \
+                "$url")
+              case "$code" in
+                200|201|204)
+                  printf '  %-6s %s\n' "$code" "$rel"
+                  return 0
+                  ;;
+                429|503)
+                  # Backoff: 1s, 2s, 4s
+                  local wait=$(( 1 << (attempt - 1) ))
+                  printf '  %-6s %s   (retry #%d in %ds)\n' "$code" "$rel" "$attempt" "$wait"
+                  sleep "$wait"
+                  ;;
+                *)
+                  printf '  %-6s %s   ← FAILED\n' "$code" "$rel"
+                  echo "    body: $(head -c 300 /tmp/upload-resp)"
+                  return 1
+                  ;;
+              esac
+            done
+            printf '  exhausted retries on %s\n' "$rel"
+            return 1
+          }
 
-            CODE=$(curl -sS -o /tmp/upload-resp -w '%{http_code}' \
-              -X PUT \
-              -H "Authorization: Bearer $NEXUS_TOKEN" \
-              -H "Content-Type: $CT" \
-              --data-binary "@$file" \
-              "$URL")
-            if [ "$CODE" = "200" ] || [ "$CODE" = "201" ] || [ "$CODE" = "204" ]; then
-              printf '  %-6s %s\n' "$CODE" "$REL_PATH"
-            else
-              printf '  %-6s %s   ← FAILED\n' "$CODE" "$REL_PATH"
-              echo "    body: $(head -c 300 /tmp/upload-resp)"
+          FAILED=0
+
+          # Build an ordered list: artifacts first, checksums second, metadata last.
+          ARTIFACTS=$(find "$STAGING" -type f \( -name '*.jar' -o -name '*.pom' \) | sort)
+          CHECKSUMS_FOR_ARTIFACTS=$(find "$STAGING" -type f \
+              \( -name '*.jar.md5' -o -name '*.jar.sha1' -o -name '*.jar.sha256' -o -name '*.jar.sha512' \
+                 -o -name '*.pom.md5' -o -name '*.pom.sha1' -o -name '*.pom.sha256' -o -name '*.pom.sha512' \) \
+              | sort)
+          METADATA=$(find "$STAGING" -type f -name 'maven-metadata.xml*' | sort)
+
+          for f in $ARTIFACTS $CHECKSUMS_FOR_ARTIFACTS $METADATA; do
+            if ! upload_one "$f"; then
               FAILED=$((FAILED + 1))
             fi
-          done < <(find "$STAGING" -type f -print0)
+            sleep 0.4
+          done
 
           rm -rf "$STAGING"
 
